@@ -89,40 +89,43 @@ export class TreeView {
 
   _render() {
     this.container.innerHTML = '';
-
-    // Total height spacer
     this._spacer = document.createElement('div');
-    this._spacer.style.cssText = `height:${this._flatNodes.length * ITEM_HEIGHT}px;position:relative;`;
+    this._spacer.className = 'jv-tree-spacer';
     this.container.appendChild(this._spacer);
-
     this._renderVisible();
   }
 
   _renderVisible() {
-    const viewH = this.container.clientHeight || 600;
+    const viewH = this.container.clientHeight || 1000;
     const start = Math.max(0, Math.floor(this._scrollTop / ITEM_HEIGHT) - OVERSCAN);
     const end = Math.min(this._flatNodes.length, Math.ceil((this._scrollTop + viewH) / ITEM_HEIGHT) + OVERSCAN);
 
-    // Remove nodes outside range
-    const existing = this._spacer.querySelectorAll('[data-idx]');
-    existing.forEach(el => {
-      const idx = +el.dataset.idx;
-      if (idx < start || idx >= end) el.remove();
-    });
+    const topPadding = start * ITEM_HEIGHT;
+    const totalHeight = this._flatNodes.length * ITEM_HEIGHT;
+    const bottomPadding = Math.max(0, totalHeight - (end * ITEM_HEIGHT));
 
-    const existingIdxs = new Set([...this._spacer.querySelectorAll('[data-idx]')].map(el => +el.dataset.idx));
+    // For better performance with variable heights, we clear and re-render if nodes don't match.
+    // However, we'll try to reuse existing elements if they are still within the window.
+    const existing = Array.from(this._spacer.querySelectorAll('[data-idx]'));
+    const existingIdxs = new Set(existing.map(el => +el.dataset.idx));
+
+    // Clear and rebuild is safer for flow-based layout
+    this._spacer.innerHTML = '';
+    
+    const topPadEl = document.createElement('div');
+    topPadEl.style.height = `${topPadding}px`;
+    this._spacer.appendChild(topPadEl);
 
     for (let i = start; i < end; i++) {
-      if (existingIdxs.has(i)) continue;
       const node = this._flatNodes[i];
       if (!node) continue;
       const el = this._buildNodeEl(node, i);
-      el.style.position = 'absolute';
-      el.style.top = `${i * ITEM_HEIGHT}px`;
-      el.style.left = '0';
-      el.style.right = '0';
       this._spacer.appendChild(el);
     }
+
+    const bottomPadEl = document.createElement('div');
+    bottomPadEl.style.height = `${bottomPadding}px`;
+    this._spacer.appendChild(bottomPadEl);
   }
 
   // ── Build a single node element ──
