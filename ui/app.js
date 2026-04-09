@@ -40,6 +40,12 @@ export class App {
     this._diffs = [];
     this._rawCache = null;
     this._searchDebounce = null;
+    this._isStringifying = false;
+    this._stringifyWorker = null;
+    this._rawDebounce = null;
+
+    // Initialize stringify worker
+    this._initWorker();
 
     this._loadTheme().then(() => {
       this._buildUI();
@@ -82,8 +88,16 @@ export class App {
       <div id="jv-main">
         <div id="jv-content" style="flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative;">
           <div id="jv-tree-panel" class="jv-panel"></div>
-          <div id="jv-raw-panel" class="jv-panel hidden">
-            <textarea id="jv-raw-textarea" spellcheck="false"></textarea>
+          <div id="jv-raw-panel" class="jv-panel hidden" style="position:relative;">
+            <div id="jv-raw-iframe-wrap" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+              <iframe id="jv-raw-frame" src="about:blank" style="flex:1;border:none;background:transparent;"></iframe>
+            </div>
+            <div class="jv-raw-loader" id="jv-raw-loader">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+              </svg>
+              <span>Streaming raw content...</span>
+            </div>
             <div id="jv-raw-status" class="ok">Valid JSON</div>
           </div>
           <div id="jv-diff-panel" class="jv-panel hidden">
@@ -374,16 +388,7 @@ export class App {
   }
 
   _wireRaw() {
-    const ta = document.getElementById('jv-raw-textarea');
-    ta.addEventListener('input', () => {
-      clearTimeout(this._rawDebounce);
-      this._rawDebounce = setTimeout(() => {
-        const ok = this._model.updateFromRaw(ta.value);
-        const status = document.getElementById('jv-raw-status');
-        status.textContent = ok ? 'Valid JSON' : 'Invalid JSON — edits will not sync until valid';
-        status.className = ok ? 'ok' : 'error';
-      }, 300);
-    });
+    // Iframe editor sync is handled in _initRawFrame
   }
 
   // ── Views ──────────────────────────────────────────
@@ -395,11 +400,7 @@ export class App {
     document.getElementById('jv-diff-panel')?.classList.toggle('hidden', view !== 'diff');
 
     if (view === 'raw') {
-      const ta = document.getElementById('jv-raw-textarea');
-      if (ta) {
-        if (this._rawCache === null) this._rawCache = this._model.toJSON();
-        ta.value = this._rawCache;
-      }
+      this._updateRawView();
     }
     if (view === 'diff' && !this._diffTreeL && document.getElementById('jv-diff-tree-l')) {
       const container = document.getElementById('jv-diff-tree-l');
@@ -419,10 +420,8 @@ export class App {
       onRefresh: (count) => this._updateNodeCount(count),
     });
     this._updateNodeCount(this._treeView.nodeCount);
-    this._model.on('change', () => this._onModelChange());
-    this._model.on('raw-change', () => {
-      if (this._view === 'tree') this._treeView?.refresh();
-    });
+    this._model.on('change', (data) => this._onModelChange(data));
+    this._model.on('raw-change', (data) => this._onModelChange({ ...data, source: 'raw' }));
   }
 
   _initDiffLeft() {
@@ -667,17 +666,171 @@ export class App {
   }
 
   // ── Utilities ──────────────────────────────────────
-  _onModelChange() {
+  _onModelChange(data = {}) {
     this._rawCache = null;
-    if (this._view === 'tree') this._treeView?.refresh();
-    if (this._view === 'raw') {
-      const ta = document.getElementById('jv-raw-textarea');
-      if (ta) {
-        this._rawCache = this._model.toJSON();
-        ta.value = this._rawCache;
-      }
+    
+    // Refresh main tree
+    this._treeView?.refresh();
+
+    // Refresh compare view (base tree and diff results)
+    if (this._diffModel) {
+      // Re-run diff logic to keep highlights in sync with base edits
+      const jsonText = JSON.stringify(this._diffModel);
+      this._invokeDiffWorker(jsonText);
+    } else {
+      // Just refresh the left tree if no secondary model is loaded yet
+      this._diffTreeL?.refresh();
     }
+
+    // Refresh raw view IF it wasn't the source of the change
+    if (this._view === 'raw' && data.source !== 'raw') {
+      this._updateRawView();
+    }
+
     this._updateBreadcrumb([]);
+  }
+
+  _initWorker() {
+    if (typeof Worker === 'undefined' || typeof chrome === 'undefined' || !chrome.runtime) return;
+    try {
+      const url = chrome.runtime.getURL('worker/stringify.worker.js');
+      this._stringifyWorker = new Worker(url);
+      
+      let incomingRaw = '';
+
+      this._stringifyWorker.onmessage = (e) => {
+        if (e.data.type === 'STRINGIFY_CHUNK') {
+          if (incomingRaw === '') {
+            // First chunk: prepare iframe
+            this._prepareIframeStream();
+          }
+          incomingRaw += e.data.chunk;
+          this._writeToIframe(e.data.chunk, e.data.isLast);
+
+          if (e.data.isLast) {
+            this._rawCache = incomingRaw;
+            incomingRaw = '';
+            this._isStringifying = false;
+            document.getElementById('jv-raw-loader')?.classList.remove('loading');
+            this._finalizeIframe();
+          }
+        } else if (e.data.type === 'PARSE_DONE') {
+          const ok = this._model.updateFromData(e.data.data);
+          this._updateStatus(ok);
+        } else if (e.data.type === 'PARSE_ERROR') {
+          this._updateStatus(false);
+        } else if (e.data.type === 'STRINGIFY_ERROR') {
+          this._isStringifying = false;
+          this._toast('Error stringifying: ' + e.data.error, 'error');
+          document.getElementById('jv-raw-loader')?.classList.remove('loading');
+        }
+      };
+    } catch (err) {
+      console.error('Failed to init worker:', err);
+    }
+  }
+
+  _updateRawView() {
+    if (this._isStringifying) return;
+    if (this._rawCache !== null) {
+      this._prepareIframeStream();
+      this._writeToIframe(this._rawCache, true);
+      this._finalizeIframe();
+      return;
+    }
+
+    if (!this._stringifyWorker) {
+      this._rawCache = this._model.toJSON();
+      this._updateRawView();
+      return;
+    }
+
+    this._isStringifying = true;
+    document.getElementById('jv-raw-loader')?.classList.add('loading');
+    this._stringifyWorker.postMessage({
+      type: 'STRINGIFY',
+      data: this._model.data,
+      indent: 2
+    });
+  }
+
+  _prepareIframeStream() {
+    const frame = document.getElementById('jv-raw-frame');
+    if (!frame) return;
+
+    this._frameDoc = frame.contentDocument || frame.contentWindow.document;
+    this._frameDoc.open();
+    this._frameDoc.write(`
+      <style>
+        body {
+          margin: 16px 20px;
+          background: transparent;
+          color: var(--text0, #e0e0e0);
+          font-family: var(--mono, "Menlo", "Monaco", "Courier New", monospace);
+          font-size: 13px;
+          line-height: 1.6;
+          white-space: pre;
+          overflow-x: auto;
+          outline: none;
+        }
+        :root {
+          --text0: #e0e0e0;
+        }
+        @media (prefers-color-scheme: light) {
+          :root { --text0: #2c3e50; }
+        }
+      </style>
+      <body spellcheck="false">`);
+  }
+
+  _writeToIframe(chunk, isLast) {
+    if (!this._frameDoc) return;
+    // Basic HTML escape for characters that might break the parser
+    const escaped = chunk.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    this._frameDoc.write(escaped);
+    if (isLast) {
+      this._frameDoc.write('</body>');
+      this._frameDoc.close();
+    }
+  }
+
+  _finalizeIframe() {
+    if (!this._frameDoc) return;
+    const body = this._frameDoc.body;
+    body.contentEditable = 'true';
+
+    // Hook up bi-directional sync
+    body.addEventListener('input', () => {
+      clearTimeout(this._rawDebounce);
+      
+      const status = document.getElementById('jv-raw-status');
+      if (status) {
+        status.textContent = 'Validating...';
+        status.className = 'info';
+      }
+
+      // Increase debounce for larger files to prevent overlapping worker calls
+      const delay = (this._model.toJSON().length > 1000000) ? 1500 : 500;
+      
+      this._rawDebounce = setTimeout(() => {
+        // textContent is significantly faster than innerText
+        const text = body.textContent;
+        if (this._stringifyWorker) {
+          this._stringifyWorker.postMessage({ type: 'PARSE', text });
+        } else {
+          const ok = this._model.updateFromRaw(text);
+          this._updateStatus(ok);
+        }
+      }, delay);
+    });
+  }
+
+  _updateStatus(ok) {
+    const status = document.getElementById('jv-raw-status');
+    if (status) {
+      status.textContent = ok ? 'Valid JSON' : 'Invalid JSON — changes will not sync';
+      status.className = ok ? 'ok' : 'error';
+    }
   }
 
   _updateNodeCount(count) {

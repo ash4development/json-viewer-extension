@@ -152,8 +152,16 @@ class JSONModel {
   updateFromRaw(text) {
     try {
       const parsed = JSON.parse(text);
+      return this.updateFromData(parsed);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  updateFromData(data) {
+    try {
       this._snapshot();
-      this._data = parsed;
+      this._data = data;
       this._valid = true;
       this._error = null;
       this._emit('raw-change', {});
